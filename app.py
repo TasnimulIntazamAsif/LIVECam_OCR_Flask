@@ -5,19 +5,22 @@ import pytesseract
 import numpy as np
 import threading
 import atexit
+import re
 
-# =========================
-# FLASK APP
-# =========================
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024  # 5MB
+app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 
 # =========================
-# CAMERA SETUP
+# CONFIG
+# =========================
+DEFAULT_COUNTRY_CODE = "+880"   # Change if needed
+
+# =========================
+# CAMERA
 # =========================
 camera = cv2.VideoCapture(0)
 if not camera.isOpened():
-    raise RuntimeError("❌ Cannot open webcam")
+    raise RuntimeError("Cannot open webcam")
 
 def release_camera():
     if camera.isOpened():
@@ -26,110 +29,168 @@ def release_camera():
 atexit.register(release_camera)
 
 # =========================
-# OCR SETUP
+# OCR
 # =========================
 reader = easyocr.Reader(['en'], gpu=False)
 
-# Uncomment if Tesseract is not in PATH
-# pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-
 # =========================
-# GLOBAL STORAGE
+# GLOBAL
 # =========================
-latest_texts = {}
-latest_boxes = {}
+latest_result = {}
 lock = threading.Lock()
 
 # =========================
-# SAFE JSON CONVERTER
+# PREPROCESSING
 # =========================
-def to_python_types(obj):
-    if isinstance(obj, dict):
-        return {k: to_python_types(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [to_python_types(i) for i in obj]
-    elif isinstance(obj, tuple):
-        return [to_python_types(i) for i in obj]
-    elif isinstance(obj, np.generic):  # np.int32, np.float32, etc.
-        return obj.item()
-    else:
-        return obj
-
-# =========================
-# TESSERACT OCR
-# =========================
-def run_tesseract_ocr(image):
+def preprocess(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    return blur
 
+# =========================
+# OCR FUNCTIONS
+# =========================
+def easyocr_text(image):
+    results = reader.readtext(image)
+    return [t.strip() for _, t, p in results if t.strip()]
+
+def tesseract_text(image):
     data = pytesseract.image_to_data(
-        gray,
+        image,
         output_type=pytesseract.Output.DICT,
         config="--oem 3 --psm 6"
     )
+    return [t.strip() for t in data["text"] if t.strip()]
 
-    texts = []
-    boxes = []
-
-    for i in range(len(data["text"])):
-        text = data["text"][i].strip()
-        conf = int(data["conf"][i])
-
-        if text and conf > 50:
-            x = int(data["left"][i])
-            y = int(data["top"][i])
-            w = int(data["width"][i])
-            h = int(data["height"][i])
-
-            texts.append(text)
-            boxes.append([[x, y], [x+w, y], [x+w, y+h], [x, y+h]])
-
-    return texts, boxes
+def merge_texts(*lists):
+    seen = []
+    for lst in lists:
+        for t in lst:
+            if t not in seen:
+                seen.append(t)
+    return seen
 
 # =========================
-# LIVE CAMERA STREAM
+# PHONE EXTRACTION (FIXED)
+# =========================
+def extract_phone_numbers(texts, default_cc="+880"):
+    joined = " ".join(texts)
+
+    candidates = re.findall(
+        r"(?:\+?\d{1,3})?[\s\-]?\(?\d{2,4}\)?[\s\-]?\d{3,4}[\s\-]?\d{3,4}",
+        joined
+    )
+
+    phones = set()
+
+    for c in candidates:
+        digits = re.sub(r"\D", "", c)
+
+        if len(digits) == 11 and digits.startswith("0"):
+            phones.add(default_cc + digits[1:])
+
+        elif len(digits) >= 12:
+            phones.add("+" + digits)
+
+        elif 9 <= len(digits) <= 10:
+            phones.add(default_cc + digits)
+
+    return list(phones)
+
+# =========================
+# CARD TYPE DETECTION
+# =========================
+def detect_card_type(texts):
+    joined = " ".join(texts).lower()
+
+    visiting_score = 0
+    id_score = 0
+
+    if extract_phone_numbers(texts):
+        visiting_score += 2
+
+    if re.search(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", joined):
+        visiting_score += 3
+
+    if "www" in joined or ".com" in joined:
+        visiting_score += 2
+
+    if re.search(r"\d{2}[-/]\d{2}[-/]\d{4}", joined):
+        id_score += 3
+
+    if re.search(r"\b\d{10,17}\b", joined):
+        id_score += 3
+
+    for t in texts:
+        if t.isupper() and len(t.split()) >= 2:
+            id_score += 1
+
+    if id_score > visiting_score:
+        return "id_card"
+    if visiting_score > id_score:
+        return "visiting_card"
+
+    return "unknown"
+
+# =========================
+# FIELD EXTRACTION (FIXED)
+# =========================
+def extract_fields(texts, card_type):
+    joined = "\n".join(texts)
+    data = {}
+
+    phones = extract_phone_numbers(texts, DEFAULT_COUNTRY_CODE)
+    emails = re.findall(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-z]{2,}", joined)
+    websites = re.findall(r"(www\.[^\s]+)", joined)
+    dob = re.findall(r"\d{2}[-/]\d{2}[-/]\d{4}", joined)
+    ids = re.findall(r"\b\d{10,17}\b", joined)
+
+    if phones:
+        data["phones"] = phones
+    if emails:
+        data["emails"] = emails
+    if websites:
+        data["websites"] = websites
+    if dob:
+        data["date_of_birth"] = dob[0]
+    if ids:
+        data["id_number"] = ids[0]
+
+    names = [t for t in texts if t.isupper() and 2 <= len(t.split()) <= 4]
+    if names:
+        data["name"] = names[0]
+
+    if card_type == "visiting_card":
+        for t in texts:
+            if any(x in t.lower() for x in ["manager", "engineer", "director", "officer"]):
+                data["designation"] = t
+                break
+
+    return data
+
+# =========================
+# LIVE STREAM
 # =========================
 def generate_frames():
-    global latest_texts, latest_boxes
-    frame_count = 0
+    global latest_result
+    count = 0
 
     while True:
-        success, frame = camera.read()
-        if not success:
+        ret, frame = camera.read()
+        if not ret:
             break
 
         frame = cv2.resize(frame, (640, 480))
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        if frame_count % 10 == 0:
-            # -------- EasyOCR --------
-            easy_results = reader.readtext(gray)
-            easy_texts = []
-            easy_boxes = []
+        if count % 10 == 0:
+            texts = merge_texts(
+                easyocr_text(frame),
+                tesseract_text(frame),
+                easyocr_text(preprocess(frame)),
+                tesseract_text(preprocess(frame))
+            )
 
-            for (bbox, text, prob) in easy_results:
-                if prob > 0.5:
-                    easy_texts.append(text)
-                    easy_boxes.append(
-                        [[int(x), int(y)] for x, y in bbox]
-                    )
-
-                    pts = np.array(bbox, dtype=np.int32)
-                    cv2.polylines(frame, [pts], True, (0, 255, 0), 2)
-                    cv2.putText(
-                        frame,
-                        text,
-                        (int(pts[0][0]), int(pts[0][1] - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (0, 255, 0),
-                        2
-                    )
-
-            # -------- Tesseract --------
-            tess_texts, tess_boxes = run_tesseract_ocr(frame)
-
-            # -------- Detection Signal --------
-            detected = bool(easy_texts or tess_texts)
+            detected = bool(texts)
 
             if detected:
                 cv2.putText(
@@ -142,24 +203,24 @@ def generate_frames():
                     3
                 )
 
+            card_type = detect_card_type(texts)
+            extracted = extract_fields(texts, card_type)
+
             with lock:
-                latest_texts = {
+                latest_result = {
                     "detected": detected,
-                    "easyocr": easy_texts,
-                    "tesseract": tess_texts
-                }
-                latest_boxes = {
-                    "easyocr": easy_boxes,
-                    "tesseract": tess_boxes
+                    "card_type": card_type,
+                    "raw_texts": texts,
+                    "extracted_data": extracted
                 }
 
-        frame_count += 1
+        count += 1
 
         _, buffer = cv2.imencode(".jpg", frame)
         yield (
             b"--frame\r\n"
-            b"Content-Type: image/jpeg\r\n\r\n"
-            + buffer.tobytes() +
+            b"Content-Type: image/jpeg\r\n\r\n" +
+            buffer.tobytes() +
             b"\r\n"
         )
 
@@ -177,54 +238,37 @@ def video_feed():
         mimetype="multipart/x-mixed-replace; boundary=frame"
     )
 
-# -------- GET OCR --------
 @app.route("/api/ocr", methods=["GET"])
 def get_ocr():
     with lock:
-        return jsonify(
-            to_python_types({
-                "status": "success",
-                "detected": latest_texts.get("detected", False),
-                "easyocr_texts": latest_texts.get("easyocr", []),
-                "tesseract_texts": latest_texts.get("tesseract", []),
-                "boxes": latest_boxes
-            })
-        )
+        return jsonify(latest_result)
 
-# -------- POST OCR --------
 @app.route("/api/ocr", methods=["POST"])
 def post_ocr():
-    if "image" not in request.files:
-        return jsonify({"error": "No image provided"}), 400
+    file = request.files.get("image")
+    if not file:
+        return jsonify({"error": "No image"}), 400
 
-    np_img = np.frombuffer(request.files["image"].read(), np.uint8)
-    image = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
-
-    if image is None:
+    img = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
         return jsonify({"error": "Invalid image"}), 400
 
-    easy_results = reader.readtext(image)
-    easy_output = []
-
-    for (bbox, text, prob) in easy_results:
-        if prob > 0.5:
-            easy_output.append({
-                "text": text,
-                "confidence": float(prob),
-                "bounding_box": [[int(x), int(y)] for x, y in bbox]
-            })
-
-    tess_texts, _ = run_tesseract_ocr(image)
-    detected = bool(easy_output or tess_texts)
-
-    return jsonify(
-        to_python_types({
-            "status": "success",
-            "detected": detected,
-            "easyocr": easy_output,
-            "tesseract": tess_texts
-        })
+    texts = merge_texts(
+        easyocr_text(img),
+        tesseract_text(img),
+        easyocr_text(preprocess(img)),
+        tesseract_text(preprocess(img))
     )
+
+    card_type = detect_card_type(texts)
+    extracted = extract_fields(texts, card_type)
+
+    return jsonify({
+        "detected": bool(texts),
+        "card_type": card_type,
+        "raw_texts": texts,
+        "extracted_data": extracted
+    })
 
 # =========================
 # MAIN
