@@ -1,4 +1,4 @@
-from flask import Flask, render_template, Response, jsonify, request
+from flask import Flask, render_template, Response, jsonify
 import cv2
 import easyocr
 import pytesseract
@@ -13,10 +13,7 @@ import re
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 
-# =========================
-# CONFIG
-# =========================
-DEFAULT_COUNTRY_CODE = "+880"   # Bangladesh (change if needed)
+DEFAULT_COUNTRY_CODE = "+880"
 
 # =========================
 # CAMERA
@@ -43,29 +40,34 @@ latest_result = {}
 lock = threading.Lock()
 
 # =========================
-# PREPROCESSING
+# FAST CARD PRESENCE CHECK (FIXED)
 # =========================
-def preprocess(image):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    return cv2.GaussianBlur(gray, (5, 5), 0)
+def card_present_in_roi(roi):
+    """
+    Fast & reliable:
+    If ROI has enough edges → card is present
+    """
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 60, 160)
+
+    edge_pixels = cv2.countNonZero(edges)
+    roi_pixels = roi.shape[0] * roi.shape[1]
+
+    edge_ratio = edge_pixels / roi_pixels
+
+    return edge_ratio > 0.015  # tuned threshold
 
 # =========================
-# OCR FUNCTIONS
+# OCR HELPERS
 # =========================
 def easyocr_with_boxes(image):
-    """
-    Returns:
-        texts: list[str]
-        boxes: list[list[tuple]]
-    """
     results = reader.readtext(image)
     texts, boxes = [], []
-
-    for bbox, text, conf in results:
+    for box, text, conf in results:
         if text.strip():
             texts.append(text.strip())
-            boxes.append(bbox)
-
+            boxes.append(box)
     return texts, boxes
 
 def tesseract_text(image):
@@ -85,130 +87,32 @@ def merge_texts(*lists):
     return seen
 
 # =========================
-# PHONE EXTRACTION (FIXED)
+# EXTRACTION
 # =========================
-def extract_phone_numbers(texts, default_cc):
+def extract_phone_numbers(texts):
     joined = " ".join(texts)
-
-    candidates = re.findall(
-        r"(?:\+?\d{1,3})?[\s\-]?\(?\d{2,4}\)?[\s\-]?\d{3,4}[\s\-]?\d{3,4}",
-        joined
-    )
-
+    matches = re.findall(r"\+?\d[\d\s\-]{8,15}", joined)
     phones = set()
 
-    for c in candidates:
-        digits = re.sub(r"\D", "", c)
-
-        # Bangladesh local format: 01XXXXXXXXX
-        if len(digits) == 11 and digits.startswith("0"):
-            phones.add(default_cc + digits[1:])
-
-        # With country code already
-        elif len(digits) >= 12:
+    for m in matches:
+        digits = re.sub(r"\D", "", m)
+        if digits.startswith("0") and len(digits) == 11:
+            phones.add(DEFAULT_COUNTRY_CODE + digits[1:])
+        elif digits.startswith("880"):
             phones.add("+" + digits)
-
-        # Missing country code
-        elif 9 <= len(digits) <= 10:
-            phones.add(default_cc + digits)
 
     return list(phones)
 
-# =========================
-# ADDRESS EXTRACTION (FIXED)
-# =========================
 def extract_address(texts):
-    address_keywords = [
-        "road", "rd", "street", "st", "sector", "block", "area",
-        "avenue", "ave", "lane", "ln", "floor", "building",
-        "dhaka", "bangladesh", "city", "zip"
-    ]
-
-    address_lines = []
-
-    for t in texts:
-        lower = t.lower()
-        if any(k in lower for k in address_keywords):
-            address_lines.append(t)
-
-    if len(address_lines) >= 2:
-        return " ".join(address_lines)
-
-    if address_lines:
-        return address_lines[0]
-
-    return None
+    keywords = ["road", "street", "sector", "block", "dhaka", "bangladesh"]
+    lines = [t for t in texts if any(k in t.lower() for k in keywords)]
+    return " ".join(lines) if lines else None
 
 # =========================
-# CARD TYPE DETECTION
-# =========================
-def detect_card_type(texts):
-    joined = " ".join(texts).lower()
-    visiting, idc = 0, 0
-
-    if extract_phone_numbers(texts, DEFAULT_COUNTRY_CODE):
-        visiting += 2
-    if re.search(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", joined):
-        visiting += 3
-    if "www" in joined or ".com" in joined:
-        visiting += 2
-
-    if re.search(r"\d{2}[-/]\d{2}[-/]\d{4}", joined):
-        idc += 3
-    if re.search(r"\b\d{10,17}\b", joined):
-        idc += 3
-
-    if idc > visiting:
-        return "id_card"
-    if visiting > idc:
-        return "visiting_card"
-    return "unknown"
-
-# =========================
-# FIELD EXTRACTION
-# =========================
-def extract_fields(texts, card_type):
-    joined = "\n".join(texts)
-    data = {}
-
-    phones = extract_phone_numbers(texts, DEFAULT_COUNTRY_CODE)
-    emails = re.findall(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-z]{2,}", joined)
-    websites = re.findall(r"(www\.[^\s]+)", joined)
-    dob = re.findall(r"\d{2}[-/]\d{2}[-/]\d{4}", joined)
-    ids = re.findall(r"\b\d{10,17}\b", joined)
-    address = extract_address(texts)
-
-    if phones:
-        data["phones"] = phones
-    if emails:
-        data["emails"] = emails
-    if websites:
-        data["websites"] = websites
-    if dob:
-        data["date_of_birth"] = dob[0]
-    if ids:
-        data["id_number"] = ids[0]
-    if address:
-        data["address"] = address
-
-    names = [t for t in texts if t.isupper() and 2 <= len(t.split()) <= 4]
-    if names:
-        data["name"] = names[0]
-
-    if card_type == "visiting_card":
-        for t in texts:
-            if any(x in t.lower() for x in ["manager", "engineer", "director", "officer"]):
-                data["designation"] = t
-                break
-
-    return data
-
-# =========================
-# LIVE STREAM WITH BOXES
+# LIVE STREAM (FIXED)
 # =========================
 def generate_frames():
     global latest_result
-    count = 0
 
     while True:
         ret, frame = camera.read()
@@ -216,40 +120,59 @@ def generate_frames():
             break
 
         frame = cv2.resize(frame, (640, 480))
+        h, w, _ = frame.shape
 
-        if count % 10 == 0:
-            easy_texts, easy_boxes = easyocr_with_boxes(frame)
+        # -------- FIXED PLACEMENT BOX --------
+        box_w, box_h = int(w * 0.75), int(h * 0.45)
+        x1, y1 = (w - box_w) // 2, (h - box_h) // 2
+        x2, y2 = x1 + box_w, y1 + box_h
 
-            texts = merge_texts(
-                easy_texts,
-                tesseract_text(frame),
-                tesseract_text(preprocess(frame))
-            )
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        cv2.putText(frame, "PLACE CARD INSIDE BOX",
+                    (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (255, 0, 0), 2)
 
+        roi = frame[y1:y2, x1:x2]
+
+        detected = False
+        texts = []
+        extracted = {}
+
+        if card_present_in_roi(roi):
+            cv2.putText(frame, "CARD DETECTED - SCANNING",
+                        (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1, (0, 0, 255), 3)
+
+            easy_texts, easy_boxes = easyocr_with_boxes(roi)
+            tess_texts = tesseract_text(roi)
+            texts = merge_texts(easy_texts, tess_texts)
             detected = bool(texts)
 
-            if detected:
-                cv2.putText(frame, "TEXT DETECTED",
-                            (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
-                            1, (0, 0, 255), 3)
+            for box in easy_boxes:
+                pts = np.array(box, dtype=np.int32)
+                pts[:, 0] += x1
+                pts[:, 1] += y1
+                cv2.polylines(frame, [pts], True, (0, 255, 0), 2)
 
-                # Draw EasyOCR bounding boxes
-                for box in easy_boxes:
-                    pts = np.array(box, dtype=np.int32)
-                    cv2.polylines(frame, [pts], True, (0, 255, 0), 2)
+            extracted = {
+                "phones": extract_phone_numbers(texts),
+                "address": extract_address(texts)
+            }
 
-            card_type = detect_card_type(texts)
-            extracted = extract_fields(texts, card_type)
+        else:
+            cv2.putText(frame, "NO CARD IN BOX",
+                        (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1, (0, 255, 255), 3)
 
-            with lock:
-                latest_result = {
-                    "detected": detected,
-                    "card_type": card_type,
-                    "raw_texts": texts,
-                    "extracted_data": extracted
-                }
-
-        count += 1
+        with lock:
+            latest_result = {
+                "detected": detected,
+                "raw_texts": texts,
+                "extracted_data": extracted
+            }
 
         _, buffer = cv2.imencode(".jpg", frame)
         yield (
@@ -271,7 +194,7 @@ def video_feed():
     return Response(generate_frames(),
                     mimetype="multipart/x-mixed-replace; boundary=frame")
 
-@app.route("/api/ocr", methods=["GET"])
+@app.route("/api/ocr")
 def get_ocr():
     with lock:
         return jsonify(latest_result)
