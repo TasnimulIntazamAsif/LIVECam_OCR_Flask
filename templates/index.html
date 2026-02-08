@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>ASIF LIVE CAMERA OCR</title>
+    <style>
+        body {
+            background: #020617;
+            color: white;
+            font-family: Arial, sans-serif;
+            text-align: center;
+        }
+        img {
+            width: 70%;
+            margin-top: 20px;
+            border: 4px solid #22c55e;
+            border-radius: 10px;
+        }
+        pre {
+            background: #0f172a;
+            padding: 12px;
+            width: 70%;
+            margin: 20px auto;
+            border-radius: 8px;
+            text-align: left;
+            color: #e5e7eb;
+        }
+        .badge {
+            display: inline-block;
+            padding: 8px 14px;
+            background: #dc2626;
+            border-radius: 8px;
+            font-weight: bold;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+
+<h1>ASIF LIVE CAMERA OCR</h1>
+<p>Flask • OpenCV • EasyOCR • Tesseract</p>
+
+<img src="{{ url_for('video_feed') }}">
+
+<div class="badge">TEXT DETECTION ENABLED</div>
+
+<h3>Available API Endpoints</h3>
+<pre>
+GET  /api/ocr
+POST /api/ocr   (form-data → image)
+</pre>
+
+<p>
+<b>GET</b> returns live OCR from EasyOCR + Tesseract
+<br>
+<b>POST</b> processes uploaded image and compares both OCR engines
+</p>
+
+</body>
+</html>
