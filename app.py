@@ -7,17 +7,17 @@ import threading
 import atexit
 import re
 
-# =========================
+
 # APP
-# =========================
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 
 DEFAULT_COUNTRY_CODE = "+880"
 
-# =========================
+
 # CAMERA
-# =========================
+
 camera = cv2.VideoCapture(0)
 if not camera.isOpened():
     raise RuntimeError("Cannot open webcam")
@@ -28,20 +28,20 @@ def release_camera():
 
 atexit.register(release_camera)
 
-# =========================
+
 # OCR
-# =========================
+
 reader = easyocr.Reader(['en'], gpu=False)
 
-# =========================
+
 # GLOBAL
-# =========================
+
 latest_result = {}
 lock = threading.Lock()
 
-# =========================
+
 # FAST CARD PRESENCE CHECK (FIXED)
-# =========================
+
 def card_present_in_roi(roi):
     """
     Fast & reliable:
@@ -58,9 +58,9 @@ def card_present_in_roi(roi):
 
     return edge_ratio > 0.015  # tuned threshold
 
-# =========================
+
 # OCR HELPERS
-# =========================
+
 def easyocr_with_boxes(image):
     results = reader.readtext(image)
     texts, boxes = [], []
@@ -86,9 +86,9 @@ def merge_texts(*lists):
                 seen.append(t)
     return seen
 
-# =========================
+
 # EXTRACTION
-# =========================
+
 def extract_phone_numbers(texts):
     joined = " ".join(texts)
     matches = re.findall(r"\+?\d[\d\s\-]{8,15}", joined)
@@ -108,9 +108,9 @@ def extract_address(texts):
     lines = [t for t in texts if any(k in t.lower() for k in keywords)]
     return " ".join(lines) if lines else None
 
-# =========================
+
 # LIVE STREAM (FIXED)
-# =========================
+
 def generate_frames():
     global latest_result
 
@@ -140,26 +140,28 @@ def generate_frames():
         extracted = {}
 
         if card_present_in_roi(roi):
+            # CARD DETECTED
             cv2.putText(frame, "CARD DETECTED - SCANNING",
                         (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         1, (0, 0, 255), 3)
 
-            easy_texts, easy_boxes = easyocr_with_boxes(roi)
+            # OCR
+            easy_texts, _ = easyocr_with_boxes(roi)  # ignore bounding boxes
             tess_texts = tesseract_text(roi)
             texts = merge_texts(easy_texts, tess_texts)
             detected = bool(texts)
-
-            for box in easy_boxes:
-                pts = np.array(box, dtype=np.int32)
-                pts[:, 0] += x1
-                pts[:, 1] += y1
-                cv2.polylines(frame, [pts], True, (0, 255, 0), 2)
 
             extracted = {
                 "phones": extract_phone_numbers(texts),
                 "address": extract_address(texts)
             }
+
+            if detected:
+                cv2.putText(frame, "TEXT DETECTED!",
+                            (20, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            1, (0, 255, 0), 3)
 
         else:
             cv2.putText(frame, "NO CARD IN BOX",
@@ -167,6 +169,7 @@ def generate_frames():
                         cv2.FONT_HERSHEY_SIMPLEX,
                         1, (0, 255, 255), 3)
 
+        # Update latest result
         with lock:
             latest_result = {
                 "detected": detected,
@@ -182,9 +185,9 @@ def generate_frames():
             b"\r\n"
         )
 
-# =========================
+
 # ROUTES
-# =========================
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -199,8 +202,8 @@ def get_ocr():
     with lock:
         return jsonify(latest_result)
 
-# =========================
+
 # MAIN
-# =========================
+
 if __name__ == "__main__":
     app.run(debug=True, use_reloader=False)
